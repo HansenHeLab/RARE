@@ -1,0 +1,802 @@
+#!/usr/bin/perl -w
+use strict;
+use Getopt::Long;
+use File::Basename;
+use Data::Dumper;
+use Bio::DB::BigWig;
+use Statistics::Basic qw(:all ipres=4);
+use Statistics::R;
+
+my $bedDir = "";
+my $inputFileLDXI = "";
+my $k27acFile = "";
+my $k4me1File = "";
+my $DHSfile = "";
+my $inputFileGwas = "";
+my $inputFileLd = "";
+my $outputPrefix = "";
+my $expFile = "";
+my $fpkmColumn = 10;
+my $geneColumn = 1;
+my $annFile = "/mnt/work1/users/hansengroup/musa/DB/gencode.v19.allGenes.gtf";
+my $consFile = "/mnt/work1/users/hansengroup/musa/DB/hg19.100way.phastCons.bw";
+my $DHSflanking = 200000;
+my $v;
+my $overwrite;
+my @suffixlist = (".bed",".BED",".narrowPeak",".broadPeak",".txt",".TXT");
+my $wt = "0";
+my $ifcFile = "/mnt/work1/users/hansengroup/musa/mutation/GWAS/IFC_may10_r0.8/distance_all_expressed_inclPromoters_geneOnce.txt";
+my $R = Statistics::R->new();
+
+GetOptions(
+    'd|beds=s' => \$bedDir,
+    'f|gwas=s' => \$inputFileGwas,
+    'l|ld=s' => \$inputFileLd,
+    'x|ldxi=s' => \$inputFileLDXI,
+    's|output=s' => \$outputPrefix,
+    'expression=s' => \$expFile,
+    'fpkmcol=i' => \$fpkmColumn,
+    'genecol=i' => \$geneColumn,
+    'flanking=i' => \$DHSflanking,
+    'cons=s' => \$consFile,
+    'w|wt=s' => \$wt,
+    'ifc=s' => \$ifcFile,
+    'v!' => \$v,
+    'O!' => \$overwrite
+    );
+
+die "$bedDir not found\n" if (! -d $bedDir);
+die "$inputFileGwas not found\n" if (! -e $inputFileGwas);
+die "$inputFileLd not found\n" if (! -e $inputFileLd);
+
+my @bedFiles;
+my @bedFileNames;
+opendir(my $dh, $bedDir) or die "Could not open $bedDir: #!\n";
+foreach my $file (readdir $dh){
+    if ($file =~ m/(dhs|dnase)/i){
+	$DHSfile = $bedDir."/".$file;
+    } elsif ($file =~ m/k27ac/i){
+	$k27acFile = $bedDir."/".$file;
+    } elsif ($file =~ m/k4me1/i){
+	$k4me1File = $bedDir."/".$file;
+    } else {
+	if ($file =~ m/(bed|peak)$/i){
+	    push @bedFiles, $file;
+	    my $fullPath = $bedDir."/".$file;
+	    my ($name,$path,$suffix) = fileparse($fullPath,@suffixlist);
+	    push @bedFileNames, $name;
+	}
+    }
+}
+closedir $dh;
+
+my ($gwasFileName,$gwasDir,$gwasExt) = fileparse($inputFileGwas);
+my @a = split(/\./,$gwasFileName);
+$outputPrefix = $a[0] if $outputPrefix eq "";
+if (! -d "$outputPrefix.tmp"){
+    mkdir "$outputPrefix.tmp";
+}
+my $tmp = "$outputPrefix.tmp/";
+
+#----------subroutines---------------
+sub usage
+{
+    print "usage: vse.sh -f snpListBed -l ldSNPList -s suffix -d dirLocation [-r r2Value] [-v] [-h]\n";
+    print "Options:\n";
+    print "-r[0.6/0.7/0.8/0.9/1]    R2 value to find SNPs in LD. default: 0.8\n";
+    print "-v           Verbose\n";
+    print "-f[path]     Location of tagSNP list. The file must be a bed file\n";
+    print "-l[path]     Location of LD snp list. Must be in this format: chr\ts\te\tldSNP\ttagSNP\n";
+    print "-s[char]     Suffix for filenames\n";
+    print "-d[path]     Path to feature directory\n";
+    print "-A[char]     Suffix for AVS/MRV files. Only used when -p is xml in order to avoid having to generate AVS/MRV again.\n";
+    print "-p           [all/AVS/MRV/xml/R] Modular run; default: all\n";
+    print "-h           This message\n";
+}
+
+sub printLog
+{
+    my $line = shift;
+    if ($v){
+        print localtime()." $line\n";
+    }
+}
+
+sub removeExtension
+{
+    my $name = shift;
+    my @bedfileName_arr = split /\./, $name;
+    my $bedfileName = $bedfileName_arr[0];
+    return $bedfileName;
+}
+sub sum
+{
+    my $arrRef = shift;
+    my $total = 0;
+    foreach my $val (@$arrRef){
+	$total+=$val;
+    }
+    return $total;
+}
+sub loadTagSNPs
+{
+    my $AVSsuffix = shift;
+    my $AVSLDX = $AVSsuffix.".AVS/".$AVSsuffix.".LDX.bed";
+    my @tagSNPs;
+    open (HIN, "grep \"#\" $AVSLDX | cut -d \" \" -f 3 |") or die "Could not open $AVSLDX file: $!\n";
+    while (<HIN>){
+        chomp;
+        push (@tagSNPs, $_);
+    }
+    close HIN;
+    return \@tagSNPs;
+}
+sub loadFileIntoArray
+{
+    my $file = shift;
+    printLog("Loading $file");
+    my @lines;
+    open (INF, "<$file") or die "Could not open $file: $!\n";
+    while (<INF>){
+        chomp;
+        push @lines, $_;
+    }
+    close INF;
+    return \@lines;
+}
+sub lineCount
+{
+    my $inputfile = shift;
+    my $totalTagSnp=`wc -l < $inputfile`;
+    $totalTagSnp =~ s/^\s+//;
+    chomp $totalTagSnp;
+    return $totalTagSnp;
+}
+sub intersectSNP
+{
+    my $raBED = shift;
+    my $targetBED = shift;
+    printLog("Calculating intersection between $raBED and $targetBED");
+    open (my $int, '-|', "bedtools intersect -a $raBED -b $targetBED -wb |cut -f 6-9 | bedtools sort -i - | bedtools merge -i - -c 4 -o collapse") or die "Could not intersect. Quitting.\n";
+    
+    my @densityArr;
+    my @lines;
+    while (<$int>){
+	chomp;
+	my ($chr,$s,$e,$ids) = split (/\t/);
+	my @collapseIds = split (/,/, $ids);
+	my $snpDensity = scalar @collapseIds;
+	$snpDensity = $snpDensity / ($e-$s);
+	push @densityArr, $snpDensity;
+	push @lines, "$chr\t$s\t$e";
+    }
+    close $int;
+    my $vector = vector(@densityArr);
+    my $avg = mean($vector);
+    my $stDev = stddev($vector);
+    my ($min,$max) = minmax(\@densityArr);
+    open (OUT2, ">$outputPrefix.DHS.id") or die;
+    open (OUT, ">", $tmp."cmp_matrix.txt") or die "Could not open $tmp/cmp_matrix.txt\n";
+    my $idCounter = 1;
+    print OUT "#Chr\tS\tE\tSnpDensity\n";
+    for (my $i=0;$i<=$#lines;$i++){
+	my $normSnpDensity = round(($densityArr[$i] - $avg)/$stDev);
+	print OUT $lines[$i]."\t".$normSnpDensity."\n";
+	print OUT2 $lines[$i]."\t".$idCounter."\n";
+	$idCounter++;
+    }
+    close OUT;
+    close OUT2;
+#     unlink $raBED;
+}
+sub widenBed
+{
+    my $bed = shift;
+    my $widenLeftBy = shift;
+    my $widenRightBy = shift;
+    my $outFile = shift;
+    printLog("Adding $widenLeftBy and $widenRightBy bp on 5' and 3' respectively to $bed.");
+    open (IN, "<$bed") or die;
+    open (OUT, ">$outFile") or die;
+    while (<IN>){
+	chomp;
+	next if $_ =~ m/^\#/;
+	my @f = split /\t/;
+	$f[1] = $f[1] - $widenLeftBy;
+	$f[2] = $f[2] + $widenRightBy;
+	print OUT join ("\t", @f[0..2])."\n";
+    }
+    close IN;
+    close OUT;
+    printLog("$outFile created");
+}
+sub indexDHS
+{
+    my $file = shift;
+    my @dhs;
+    printLog("Indexing $file");
+    open (IN, "<$file") or die;
+    while (<IN>){
+	chomp;
+	next if $_ =~ m/^\#/;
+	my @f = split /\t/;
+	my $loc = {id=>"$f[0]:$f[1]:$f[2]", count=>0};
+	push @dhs, $loc;
+    }
+    close IN;
+    return \@dhs;
+}
+sub addToArray
+{
+    my $arrRef = shift;
+    my @arr = @$arrRef;
+    my $id = shift;
+    my $addBy = shift;
+    my $arrIdKey = shift;
+    my $arrCountKey = shift;
+    foreach my $key (@arr){
+	if ($key->{$arrIdKey} eq $id){
+	    $key->{$arrCountKey}+=$addBy;
+	    last;
+	}
+    }
+}
+sub intersectGenes
+{
+    my $cmpFile = $tmp."cmp_matrix.txt";
+    my $targetBED = shift;
+    my $flankingSizeL = shift;
+    my $flankingSizeR = shift;
+    my ($targetBEDfileName,$targetBEDpath,$targetBEDext) = fileparse($targetBED);
+    if ($targetBEDfileName eq "exp_gene.bed"){
+	$targetBEDfileName = "ExpressedGeneDensity";
+    } elsif ($targetBEDfileName eq "de_gene.bed"){
+	$targetBEDfileName = "DEGeneDensity";
+    }
+    my $tmpCmpFile = $tmp."widerDHS.bed";
+    printLog("Calculating intersection between $tmpCmpFile and $targetBED");
+    widenBed($cmpFile,$flankingSizeL,$flankingSizeR,$tmpCmpFile);
+    my $wideDhsListArrRef = indexDHS($tmpCmpFile);
+    my @wideDhsListArr = @$wideDhsListArrRef;
+    
+    open (my $int, '-|', "bedtools intersect -a $tmpCmpFile -b $targetBED -wao |cut -f 1,2,3,5,6,7") or die "Could not intersect. Quitting.\n";
+    my @densityArr;
+    open (OUT, ">$tmp/sushi_genes.bed") or die;
+    print OUT "chrom\tstart\tstop\tgene\tscore\tstrand\ttype\n";
+    while (<$int>){
+	chomp;
+	my ($chr,$s,$e,$geneS,$geneE,$ids) = split (/\t/);
+	if ($ids eq ""){
+	    my $locId = "$chr:$s:$e";
+	    addToArray(\@wideDhsListArr,$locId,0,"id","count");
+	} else {
+	    my $locId = "$chr:$s:$e";
+	    addToArray(\@wideDhsListArr,$locId,1,"id","count");
+	    $geneS -= 500;
+	    $geneE +=500;
+	    print OUT "$chr\t$geneS\t$geneE\t$ids\t1000\t+\tgene\n";
+	}
+    }
+    close $int;
+    close OUT;
+#    my $linesRef = loadFileIntoArray($cmpFile);
+ #   my @lines = @$linesRef;
+    my @lines;
+    open (IN, "<", $cmpFile) or die;
+    my $header = <IN>;
+    chomp $header;
+    while (<IN>){
+	chomp;
+	push @lines, $_;
+    }
+    close IN;
+
+    foreach my $key (@wideDhsListArr){
+	my $count = $key->{'count'};
+	my ($dhsC,$dhsS,$dhsE) = split(/:/, $key->{'id'});
+	my $density = $count / ($dhsE - $dhsS);
+	push (@densityArr, $density);
+    }
+    my $vector = vector(@densityArr);
+    my $avg = mean($vector);
+    my $stDev = stddev($vector);
+
+    open (OUT, ">", $tmp."cmp_matrix.txt") or die "Could not open $tmp/cmp_matrix.txt\n";
+    $header .= "\t$targetBEDfileName\n";
+    print OUT $header;
+    for (my $i=0;$i<=$#lines;$i++){
+	my $normGeneDensity = round(($densityArr[$i]-$avg)/$stDev);
+	print OUT $lines[$i]."\t".$normGeneDensity."\n";
+    }
+    close OUT;
+}
+sub round
+{
+    my $x = shift;
+    return sprintf ('%0.2f', $x);
+}
+sub intersectBed
+{
+    my $targetBed = shift;
+    my $cols = shift;
+    my $cmpFile = $tmp."cmp_matrix.txt";
+    my ($name,$path,$suffix) = fileparse($targetBed,@suffixlist);
+    printLog("Calculating intersection between $cmpFile and $targetBed");
+    open (my $int, '-|', "bedtools intersect -a $cmpFile -b $targetBed -wao | bedtools merge -i - -c $cols -o mean") or die "Could not intersect. Quitting.\n";
+    my @lines;
+    my @densityArr;
+    while (<$int>){
+	chomp;
+	my @cols = split (/\t/);
+	if ($cols[$#cols] > 0){
+	    push @densityArr, $cols[$#cols];
+	} else {
+	    push @densityArr, 0;
+	}
+    }
+    close $int;
+    my $vector = vector(@densityArr);
+    my $avg=mean($vector);
+    my $stDev = stddev($vector);
+    my ($min,$max) = minmax(\@densityArr);
+    open (IN, "<", $cmpFile) or die;
+    my $header = <IN>;
+    chomp $header;
+    while (<IN>){
+	chomp;
+	push @lines, $_;
+    }
+    close IN;
+    $header .= "\t$name\n";
+    open (OUT, ">", $cmpFile) or die "Could not open $tmp/cmp_matrix.txt\n";
+    print OUT $header;
+    for (my $i=0;$i<=$#lines;$i++){
+	my $normSnpDensity = round(($densityArr[$i]  - $avg)/$stDev);
+	print OUT $lines[$i]."\t".$normSnpDensity."\n";
+#	print OUT $lines[$i]."\t".$densityArr[$i]."\n";
+    }
+    close OUT;
+}
+sub intersectTF
+{
+    my $targetBed = shift;
+    my $cols = shift;
+    my $bedName = shift;
+    $cols = "1,2,3,".$cols;
+    my $cmpFile = $tmp."cmp_matrix.txt";
+    printLog("Calculating intersection between $cmpFile and $bedName");
+    open (my $int, '-|', "bedtools intersect -a $cmpFile -b $targetBed -wao | cut -f $cols | bedtools merge -i - -c 4 -o mean") or die "Could not intersect. Quitting.\n";
+    my @lines;
+    my @densityArr;
+    open (OUT, ">>", $tmp."cmp_TF.txt") or die "Could not open $tmp/cmp_TF.txt\n";
+    while (<$int>){
+	chomp;
+	my @cols = split /\t/;
+	print OUT join("\t", @cols[0..2]);
+	if ($cols[$#cols] > 0){
+	    print OUT "\t".$bedName;
+	} else {
+	    print OUT "\tnone";
+	}
+	print OUT "\n";
+	print OUT join("\t", @cols[0..2])."\tnone\n";
+    }
+    close $int;
+    close OUT;
+}
+
+sub countTF
+{
+    my $tfFile = $tmp."cmp_TF.txt";
+    my $cmpFile = $tmp."cmp_matrix.txt";
+    my $totalTFs = $#bedFiles;
+    printLog("Mering $tfFile with $cmpFile");
+    open (my $int, '-|', "bedtools sort -i $tfFile | bedtools merge -i - -c 4 -o collapse,count_distinct") or die "Could not intersect. Quitting.\n";
+    my @lines;
+    my @densityArr;
+    my $idCounter = 1;
+    open (OUT, ">$outputPrefix.TF-matrix.txt") or die;
+    print OUT "DHSID";
+    my %TFscoreArr;
+    foreach my $TF (@bedFileNames){
+	@{$TFscoreArr{$TF}} = ();
+    }
+    while (<$int>){
+	chomp;
+	my @cols = split /\t/;
+	my $tfDensity = ($cols[$#cols]-1)/$totalTFs;
+	push @densityArr, $tfDensity;
+	#---check which TFs are overlapping
+	my @TFs = split (/,/, $cols[$#cols-1]);
+	my %TFscore;
+	foreach my $TF (@TFs){
+	    next if $TF eq "none";
+	    $TFscore{$TF} = 1;
+	}
+	undef @TFs;
+	#-----
+	#---print in order of the TFs saved in bedFileNames
+	foreach my $TFname (@bedFileNames){
+	    if (exists $TFscore{$TFname}){
+		push($TFscoreArr{$TFname}, 1);
+	    } else {
+		push($TFscoreArr{$TFname}, 0);
+	    }
+	}
+	#-----
+    }
+    close $int;
+    my $vector = vector(@densityArr);
+    my $avg=mean($vector);
+    my $stDev = stddev($vector);
+    my ($min,$max) = minmax(\@densityArr);
+
+    my %order;
+    foreach my $TF (@bedFileNames){
+	my $totalOverlap = 0;
+	foreach my $score (@{$TFscoreArr{$TF}}){
+	    $totalOverlap ++ if $score > 0;
+	}
+	$order{$TF} = $totalOverlap;
+    }
+    foreach my $TF (sort {$order{$b} <=> $order{$a}} keys %order){
+	print OUT "\t$TF";
+    }
+    print OUT "\n";
+    open (IN, "<", $cmpFile) or die;
+    my $header = <IN>;
+    chomp $header;
+    while (<IN>){
+	chomp;
+	push @lines, $_;
+	print OUT $idCounter;
+	foreach my $TF (sort {$order{$b} <=> $order{$a}} keys %order){
+	    print OUT "\t".${$TFscoreArr{$TF}}[$idCounter-1];
+	}
+	print OUT "\n";
+	$idCounter ++;
+    }
+    close IN;
+    $header .= "\tTfOccupanyRate\n";
+    close OUT;
+    open (OUT, ">", $cmpFile) or die "Could not open $tmp/cmp_matrix.txt\n";
+    print OUT $header;
+    for (my $i=0;$i<=$#lines;$i++){
+	my $normSnpDensity = round(($densityArr[$i] - $avg) / $stDev);
+	print OUT $lines[$i]."\t".$normSnpDensity."\n";
+#	print OUT $lines[$i]."\t".$densityArr[$i]."\n";
+    }
+    close OUT;
+    #---producing figure
+	
+    printLog("Generating TF occupancy matrix plot");
+    $R->set("inputFile", $outputPrefix.".TF-matrix.txt");
+#    $R->set("inputFile", $tmp.".tmp");
+    $R->set("outputFile", $outputPrefix.".TF-matrix.pdf");
+    my $cmds = <<'EOF';
+library(ggplot2)
+library(reshape2)
+pdf(outputFile)
+mat <- read.table(inputFile, header=TRUE, sep="\t")
+row.names(mat)<-mat[,1]
+mat2 <- mat[,-1]
+#write.csv(row.names(mat2), file="test")
+mat2<- mat2[do.call(order, c(as.data.frame(mat2), decreasing=TRUE)),]
+mat.m = melt(as.matrix(mat2))
+ggplot(mat.m, aes(Var2,Var1)) +
+   geom_tile(aes(fill=value), colour="white") + 
+   scale_fill_gradient(low="white", high="red") + 
+   theme_grey(base_size=8) + 
+   labs(x="",y="")  + 
+   theme(legend.position=0, axis.ticks=element_blank(), axis.text.x=element_text(size = 9 * 0.7, angle=-90, hjust=0, colour="black"), axis.text.y=element_blank())
+dev.off()
+
+EOF
+
+    my $out = $R->run($cmds);
+}
+
+sub colsToPass
+{
+    my $totalColsInMatrix = `awk '{print NF; exit}' $tmp/cmp_matrix.txt`;
+    chomp $totalColsInMatrix;
+    # my $colsToPass = "4";
+    # if ($totalColsInMatrix > 4){
+    # 	my $counter=5;
+    # 	while ($counter <= $totalColsInMatrix){
+    # 	    $colsToPass = $colsToPass.",".$counter;
+    # 	    $counter++;
+    # 	}
+    # }
+    my $latestSignalColumn = $totalColsInMatrix+5;
+    #$colsToPass .= ",".$latestSignalColumn;
+    #return $colsToPass;
+    return $latestSignalColumn;
+}
+sub log10 {
+    my $n = shift;
+    return -(log($n)/log(10));
+}
+sub minmax
+{
+    my $arrRef = shift;
+    my @arr = sort {$a <=> $b} @$arrRef;
+    return ($arr[0], $arr[$#arr]);
+}
+sub explodeGtf
+{
+    my $inputText = shift;
+#    my $tagSeparator = shift;
+#    my $pairSeparator = shift;
+    my @f = split /\t/;
+    my %tags = ('chr' => $f[0], 'source' => $f[1], 'type' => $f[2], 'start' => $f[3], 'end' => $f[4], 'col6' => $f[5], 'strand' => $f[6], 'col8' => $f[7], 'attr' => $f[8]);
+#    my @pairs = split /$tagSeparator/, $tags{'attr'};
+    my @pairs = split (/[;,]/, $tags{'attr'});
+    foreach my $pair (@pairs){
+        $pair =~ s/^\s+|\s+$//g;
+        my @tagsArr = split (/\s/, $pair);
+        $tagsArr[1] =~ s/"//g;
+        $tags{$tagsArr[0]} = $tagsArr[1];
+    }
+    return \%tags;
+}
+sub loadGenes
+{
+    printLog("Loading gene positions from annotation");
+    open (IN, "<$annFile") or die "Could not open $annFile\n";
+    my %geneInfo;
+    while (<IN>){
+	chomp;
+	my $line = explodeGtf($_);
+	if ($line->{'type'} =~ m/gene/i){
+	    %{$geneInfo{$line->{'gene_name'}}} = %$line;
+#	    $geneInfo{$line->{'gene_name'}}->{'start'} = $line->{'start'};
+#	    $geneInfo{$line->{'gene_name'}}->{'chr'} = $line->{'chr'};
+	}
+    }
+    close IN;
+    printLog("Gene positions loaded");
+    return \%geneInfo;
+}
+sub intersectCons
+{
+    my $cmpFile = $tmp."cmp_matrix.txt";
+    printLog("conservation analysis started");
+    my $dhsArrRef = indexDHS($cmpFile);
+    my @dhsArr = @$dhsArrRef;
+    my $wigInstance  = Bio::DB::BigWig->new(-bigwig=>$consFile);
+    my @densityArr; my @lines;
+    printLog("Calculating average conservation score for each site");
+    foreach my $key (@dhsArr){
+	my $count = $key->{'count'};
+	my ($dhsC,$dhsS,$dhsE) = split (/:/, $key->{id});
+	my @fetchFromBigWig = $wigInstance->features(-seq_id=>$dhsC, -start=>$dhsS, -end=>$dhsE);
+	for my $region (@fetchFromBigWig){
+	    $key->{'count'} += $region->score;
+	}
+	my $avgCons = $key->{'count'} / ($dhsE - $dhsS);
+	push @densityArr, $avgCons;
+    }
+    my $vector = vector(@densityArr);
+    my $avg=mean($vector);
+    my $stDev = stddev($vector);
+    open (IN, "<", $cmpFile) or die;
+    my $header=<IN>;
+    chomp $header;
+    while (<IN>){
+	chomp;
+	push @lines, $_;
+    }
+    close IN;
+    $header .= "\tConservationScore\n";
+    open (OUT, ">", $cmpFile) or die "Could not open $tmp/cmp_matrix.txt\n";
+    print OUT $header;
+    for (my $i=0;$i<=$#lines;$i++){
+	my $normSnpDensity = round(($densityArr[$i] - $avg) / $stDev);
+	print OUT $lines[$i]."\t".$normSnpDensity."\n";
+#	print OUT $lines[$i]."\t".$densityArr[$i]."\n";
+    }
+    close OUT;
+}
+    
+#-------------------------
+
+$DHSfile ne "" ? intersectSNP($inputFileLd,$DHSfile) : die "You must provide the list of DHS in a bed format in the $bedDir. The filename must contain DHS or DNAse (case insensitive).\n";
+
+if ($k4me1File ne ""){
+    my $colsToPass = colsToPass();
+    intersectBed($k4me1File,$colsToPass);
+}
+
+if ($k27acFile ne ""){
+    my $colsToPass = colsToPass();
+    intersectBed($k27acFile,$colsToPass);
+}
+
+if ( -e $tmp."cmp_TF.txt"){
+    unlink $tmp."cmp_TF.txt";
+}
+for (my $j=0; $j<=$#bedFiles; $j++){
+    my $file = $bedFiles[$j];
+    my $fileName = $bedFileNames[$j];
+    my $filePath = $bedDir."/".$file;
+    
+    printLog("Reading $filePath");
+    my $colsToPass = colsToPass();
+    intersectTF($filePath,$colsToPass,$fileName);
+}
+countTF();
+
+
+#------------EXPRESSION-------------------------
+if ($expFile ne ""){
+    my $geneInfoRef = loadGenes();
+    my %geneInfo = %$geneInfoRef;
+#    print Dumper %geneInfo;
+    open (IN, "<$expFile") or die "Could not open $expFile\n";
+    open (OUT, ">".$tmp."exp_gene.bed") or die;
+    open (OUT2, ">".$tmp."de_gene.bed") or die;
+    while (<IN>){
+    	chomp;
+    	my @f = split /\t/;
+    	my $gene = $f[$geneColumn - 1];
+    	if (exists $geneInfo{$gene}){
+     	    my $end = $geneInfo{$gene}->{'start'} + 1;
+     	    print OUT $geneInfo{$gene}->{'chr'}."\t".$geneInfo{$gene}->{'start'}."\t".$end."\t".$gene."\n";
+	    if ($f[3] >= 0.17 || $f[3] <= -0.12){
+		print OUT2 $geneInfo{$gene}->{'chr'}."\t".$geneInfo{$gene}->{'start'}."\t".$end."\t".$gene."\n";
+	    }
+     	}
+     }
+     close IN;
+     close OUT;
+    close OUT2;
+    intersectGenes($tmp."exp_gene.bed",$DHSflanking, $DHSflanking);
+    intersectGenes($tmp."de_gene.bed",$DHSflanking, $DHSflanking);
+
+    printLog("Processing interaction file $ifcFile");
+    open (IN, "<$ifcFile") or die;
+    open (OUT, ">$tmp/sushi_ifc.bedpe") or die;
+    print OUT "chrom1\tstart1\tend1\tchrom2\tstart2\tend2\tscore\tname\tstrand1\tstrand2\tsamplenumber\n";
+    while (<IN>){
+	chomp;
+	my @f = split /\t/;
+	next if $f[1] =~ /promoter/i;
+	my @pos = split (/:/, $f[1]);
+	if (exists $geneInfo{$f[0]}){
+	    my $promoterS = $geneInfo{$f[0]}->{'start'} - 500;
+	    my $promoterE = $geneInfo{$f[0]}->{'start'} + 500;
+	    print OUT $geneInfo{$f[0]}->{'chr'}."\t".$promoterS."\t".$promoterE."\t$pos[0]\t$pos[1]\t$pos[2]\t".$f[3]."\t".$f[0]."\t.\t.\t1\n";
+	}
+    }
+    close IN;
+    close OUT;
+}
+#-----------------------------------------------
+
+#------------CONSERVATION-----------------------
+intersectCons();
+#-----------------------------------------------
+
+#-----------COMPILE MATRIX---------------------
+my %scores;
+my @variables;
+open (IN, "<",$tmp."cmp_matrix.txt") or die;
+open (OUT, ">",$outputPrefix.".matrix.txt") or die;
+my $idCounter = 0;
+while (<IN>){
+    chomp;
+    my @f = split /\t/;
+    if (/^\#/){
+	@variables = @f[3..$#f];
+	print OUT "DHSID\t".join("\t", @f[3..$#f]);
+    } else {
+	$scores{$idCounter}->{'combined'} = 0;
+	for (my $i=3;$i<=$#f; $i++){
+	    $scores{$idCounter}->{$variables[$i-3]} = $f[$i];
+	    if ($wt eq "0"){
+		$scores{$idCounter}->{'combined'} += $f[$i] * 1 / scalar @variables;
+	    } else {
+		my @wt = split (/,/, $wt);
+		die "Weight parameter seems incorrect\n" if scalar @wt != scalar @variables;
+		my $totalWt = sum(\@wt);
+		$scores{$idCounter}->{'combined'} += $f[$i] * $wt[$i-3] / $totalWt;
+	    }
+	}
+    }
+    $idCounter++;
+}
+close IN;
+print OUT "\tCombined\n";
+my @combinedScoreArr;
+foreach my $id (sort {$scores{$b}->{'combined'} <=> $scores{$a}->{'combined'}} keys %scores){
+    push @combinedScoreArr, $scores{$id}->{'combined'};
+}
+my $vector = vector(@combinedScoreArr);
+my $avg=mean($vector);
+my $stDev = stddev($vector);
+foreach my $id (sort {$scores{$b}->{'combined'} <=> $scores{$a}->{'combined'}} keys %scores){
+    print OUT $id;
+    foreach my $variable (@variables){
+	print OUT "\t".$scores{$id}->{$variable};
+    }
+    print OUT "\t".round(($scores{$id}->{'combined'} - $avg)/$stDev);
+    print OUT "\n";
+}
+close OUT;
+
+
+$R = Statistics::R->new();
+$R->set("inputFile", $outputPrefix.".matrix.txt");
+$R->set("outputFile", $outputPrefix.".matrix-cor.pdf");
+$R->set("outputFile2", $outputPrefix.".matrix-heatmap.pdf");
+my $cmds = <<'EOF';
+library(ggplot2)
+library(car)
+pdf(outputFile)
+mat <- read.table(inputFile, header=TRUE, sep="\t")
+row.names(mat)<-mat[,1]
+mat <- mat[,-1]
+scatterplotMatrix(mat)
+dev.off()
+
+library(reshape2)
+pdf(outputFile2)
+mat.m = melt(as.matrix(mat))
+ggplot(mat.m, aes(Var2,Var1)) +  geom_tile(aes(fill=value), colour="white") + 
+    scale_fill_gradient(low="white", high="steelblue", name="Z-score") + 
+   theme_grey(base_size=8) + 
+   labs(x="",y="")  + theme_classic() +
+   theme(axis.ticks=element_blank(), axis.text.x=element_text(size = 9 * 0.7, angle=-90, hjust=0, colour="black"), axis.text.y=element_blank())
+dev.off()
+
+EOF
+#
+$R->run($cmds);
+
+open (IN, "<$outputPrefix.DHS.id") or die;
+open (OUT, ">>$tmp/sushi_genes.bed") or die;
+my %dhs;
+while (<IN>){
+    chomp;
+my @f = split /\t/;
+$dhs{$f[3]}->{C} = $f[0];
+$dhs{$f[3]}->{S} = $f[1];
+$dhs{$f[3]}->{E} = $f[2];
+print OUT "$f[0]\t$f[1]\t$f[2]\t$f[3]\t1000\t+\tDHS\n";
+}
+close IN;
+close OUT;
+
+my $counter = 1;
+$R->set("sushi_gene", $tmp."sushi_gene.bed");
+$R->set("sushi_ifc", $tmp."sushi_ifc.bedpe");
+$R->set("snp", $inputFileLd);
+$R->set("outTop", "$outputPrefix.top10.pdf");
+#$R->run(q`par(mar=c(rep(0.2,4)), mfrow=c(6,1), oma=c(4,4,0.2,0.2), mgp=c(2.4, 0.35, 0))`);
+foreach my $id (sort {$scores{$b}->{'combined'} <=> $scores{$a}->{'combined'}} keys %scores){
+    my $boundaryL = $dhs{$id}->{S} - 2000000;
+my $boundaryR = $dhs{$id}->{E} + 2000000;
+$R->set("chrom", $dhs{$id}->{C});
+$R->set("chromstart", $boundaryL);
+$R->set("chromend", $boundaryR);
+my $cmd = <<'EOF2';
+library("Sushi")
+Sushi_genes.bed <- read.table(sushi_gene, header=TRUE)
+Sushi_IFC = read.table(sushi_ifc, header=TRUE)
+snp <- read.table(snp, header=FALSE)
+pdf(outTop)
+#par(mar=c(rep(0.2,4)), mfrow=c(6,1), oma=c(4,4,0.2,0.2), mgp=c(2.4, 0.35, 0))
+pbpe = plotBedpe(Sushi_IFC, chrom, chromstart, chromend, heights = Sushi_IFC$score, plottype = "loops", colorbyrange= Sushi_IFC$score, lwdby=Sushi_IFC$score)
+pg = plotGenes(Sushi_genes.bed, chrom,chromstart, chromend, type=Sushi_genes.bed$types, maxrows=15, height=0.05, plotgenetype="box", labeltext=FALSE)
+plotBed(snp, chrom,chromstart,chromend,colorbycol=SushiColors(3), row=1, wiggle=0.001, splitstrand=FALSE)
+dev.off()
+EOF2
+
+	$R->run($cmd);
+last;
+}
+$R->stop;
+#--------------------------------
+
+#------IFC----------------------
