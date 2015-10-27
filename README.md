@@ -6,11 +6,13 @@ Additionally, RARE requires the following CPAN Perl modules:
 ```File::Basename
 Bio::DB::BigWig
 Statistics::Basic
-Statistics::R```
+Statistics::R
+```
 
 The following R libraries are required for generating plots:
 
 ```ggplot2
 reshape2
 Gviz
-car```
+car
+```
